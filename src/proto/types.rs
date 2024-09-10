@@ -1,7 +1,5 @@
 //! Types required for the WebSocket protocol implementation.
-use std::{
-    cell::UnsafeCell, fmt, hint::unreachable_unchecked, mem::replace, num::NonZeroU16, ops::Deref,
-};
+use std::{fmt, hint::unreachable_unchecked, mem::replace, num::NonZeroU16, ops::Deref};
 
 use bytes::{BufMut, Bytes, BytesMut};
 
@@ -162,7 +160,7 @@ impl TryFrom<u16> for CloseCode {
 /// [`Into<BytesMut>`]: #impl-From<Payload>-for-BytesMut    
 pub struct Payload {
     /// The raw payload data.
-    data: UnsafeCell<PayloadStorage>,
+    data: PayloadStorage,
     /// Whether the payload data was validated to be valid UTF-8.
     utf8_validated: bool,
 }
@@ -171,7 +169,7 @@ impl Payload {
     /// Creates a new shared `Payload` from a static slice.
     const fn from_static(bytes: &'static [u8]) -> Self {
         Self {
-            data: UnsafeCell::new(PayloadStorage::Shared(Bytes::from_static(bytes))),
+            data: PayloadStorage::Shared(Bytes::from_static(bytes)),
             utf8_validated: false,
         }
     }
@@ -184,7 +182,7 @@ impl Payload {
     /// Shortens the buffer, keeping the first `len` bytes and dropping the
     /// rest.
     pub(super) fn truncate(&mut self, len: usize) {
-        match self.data.get_mut() {
+        match &mut self.data {
             PayloadStorage::Unique(b) => b.truncate(len),
             PayloadStorage::Shared(b) => b.truncate(len),
         }
@@ -197,10 +195,10 @@ impl Payload {
         // split a utf8 codepoint), we set it to false.
         self.utf8_validated = false;
         Self {
-            data: UnsafeCell::new(match self.data.get_mut() {
+            data: match &mut self.data {
                 PayloadStorage::Unique(b) => PayloadStorage::Unique(b.split_to(at)),
                 PayloadStorage::Shared(b) => PayloadStorage::Shared(b.split_to(at)),
-            }),
+            },
             utf8_validated: false,
         }
     }
@@ -210,16 +208,13 @@ impl Payload {
         if let PayloadStorage::Shared(bytes) = self.as_ref() {
             bytes
         } else {
-            // SAFETY: No concurrent access is possible as Payload is !Sync and
-            // `0` is not read again before it's overwritten.
-            unsafe {
-                let payload = self.data.get().read();
-                let bytes = match payload {
+            let bytes =
+                match std::mem::replace(&mut self.data, PayloadStorage::Shared(Default::default()))
+                {
                     PayloadStorage::Unique(p) => p.freeze(),
                     PayloadStorage::Shared(_) => unreachable_unchecked(),
                 };
-                self.data.get().write(PayloadStorage::Shared(bytes));
-            }
+            self.data = PayloadStorage::Shared(bytes);
             match self.as_ref() {
                 // SAFETY: We just wrote `Shared` into `value`
                 PayloadStorage::Unique(_) => unsafe { unreachable_unchecked() },
@@ -231,8 +226,7 @@ impl Payload {
 
 impl AsRef<PayloadStorage> for Payload {
     fn as_ref(&self) -> &PayloadStorage {
-        // SAFETY: No outstanding mutable references exists.
-        unsafe { &*self.data.get() }
+        &self.data
     }
 }
 
@@ -240,7 +234,7 @@ impl Clone for Payload {
     fn clone(&self) -> Self {
         let bytes = self.as_bytes();
         Self {
-            data: UnsafeCell::new(PayloadStorage::Shared(bytes.clone())),
+            data: PayloadStorage::Shared(bytes.clone()),
             utf8_validated: self.utf8_validated,
         }
     }
@@ -267,11 +261,11 @@ impl From<Bytes> for Payload {
     fn from(value: Bytes) -> Self {
         match value.try_into_mut() {
             Ok(value) => Self {
-                data: UnsafeCell::new(PayloadStorage::Unique(value)),
+                data: PayloadStorage::Unique(value),
                 utf8_validated: false,
             },
             Err(value) => Self {
-                data: UnsafeCell::new(PayloadStorage::Shared(value)),
+                data: PayloadStorage::Shared(value),
                 utf8_validated: false,
             },
         }
@@ -281,7 +275,7 @@ impl From<Bytes> for Payload {
 impl From<BytesMut> for Payload {
     fn from(value: BytesMut) -> Self {
         Self {
-            data: UnsafeCell::new(PayloadStorage::Unique(value)),
+            data: PayloadStorage::Unique(value),
             utf8_validated: false,
         }
     }
@@ -289,7 +283,7 @@ impl From<BytesMut> for Payload {
 
 impl From<Payload> for Bytes {
     fn from(value: Payload) -> Self {
-        match value.data.into_inner() {
+        match value.data {
             PayloadStorage::Unique(p) => p.freeze(),
             PayloadStorage::Shared(p) => p,
         }
@@ -298,7 +292,7 @@ impl From<Payload> for Bytes {
 
 impl From<Payload> for BytesMut {
     fn from(value: Payload) -> Self {
-        match value.data.into_inner() {
+        match value.data {
             PayloadStorage::Unique(p) => p,
             PayloadStorage::Shared(p) => p.into(),
         }
@@ -311,7 +305,7 @@ impl From<Vec<u8>> for Payload {
         // Vec, effectively allowing us to use BytesMut::from_vec which isn't
         // exposed in bytes. See https://github.com/tokio-rs/bytes/issues/723 for details.
         Self {
-            data: UnsafeCell::new(PayloadStorage::Unique(BytesMut::from_iter(value))),
+            data: PayloadStorage::Unique(BytesMut::from_iter(value)),
             utf8_validated: false,
         }
     }
@@ -321,9 +315,7 @@ impl From<String> for Payload {
     fn from(value: String) -> Self {
         // See From<Vec<u8>> impl for reasoning behind this.
         Self {
-            data: UnsafeCell::new(PayloadStorage::Unique(BytesMut::from_iter(
-                value.into_bytes(),
-            ))),
+            data: PayloadStorage::Unique(BytesMut::from_iter(value.into_bytes())),
             utf8_validated: true,
         }
     }
@@ -332,7 +324,7 @@ impl From<String> for Payload {
 impl From<&'static [u8]> for Payload {
     fn from(value: &'static [u8]) -> Self {
         Self {
-            data: UnsafeCell::new(PayloadStorage::Shared(Bytes::from_static(value))),
+            data: PayloadStorage::Shared(Bytes::from_static(value)),
             utf8_validated: false,
         }
     }
@@ -341,7 +333,7 @@ impl From<&'static [u8]> for Payload {
 impl From<&'static str> for Payload {
     fn from(value: &'static str) -> Self {
         Self {
-            data: UnsafeCell::new(PayloadStorage::Shared(Bytes::from_static(value.as_bytes()))),
+            data: PayloadStorage::Shared(Bytes::from_static(value.as_bytes())),
             utf8_validated: true,
         }
     }
